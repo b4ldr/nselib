@@ -64,6 +64,7 @@ types = {
 
 CLASS = {
     IN = 1,
+    CH = 3,
     ANY = 255
 }
 
@@ -253,7 +254,7 @@ function query(dname, options)
     if not options then options = {} end
 
     local dtype, host, port = options.dtype, options.host, options.port
-
+    local class = options.class or CLASS.IN
     if not options.tries then options.tries = 10 end -- don't get into an infinite loop
 
     if not options.sendCount then options.sendCount = 2 end
@@ -281,11 +282,15 @@ function query(dname, options)
     end
 
     local pkt = newPacket()
-    addQuestion(pkt, dname, dtype)
+    addQuestion(pkt, dname, dtype, class)
     if options.norecurse then pkt.flags.RD = false end
 
-    if options.dnssec then
+    if options.dnssec and not options.nsid then
         addOPT(pkt, {DO = true})
+    elseif options.dnssec and options.nsid then
+        addNSID(pkt, {DO = true})
+    elseif not options.dnssec and options.nsid then
+        addNSID(pkt, {})
     end
 
 	if ( options.flags ) then pkt.flags.raw = options.flags end
@@ -1271,13 +1276,14 @@ end
 -- @param pkt Table representing DNS packet.
 -- @param dname Domain name to be asked.
 -- @param dtype RR to be asked.
-function addQuestion(pkt, dname, dtype)
+function addQuestion(pkt, dname, dtype, class)
     if type(pkt) ~= "table" then return nil end
     if type(pkt.questions) ~= "table" then return nil end
+    local class = class or CLASS.IN
     local q = {}
     q.dname = dname
     q.dtype = dtype
-    q.class = CLASS.IN
+    q.class = class
     table.insert(pkt.questions, q)
     return pkt
 end
@@ -1314,21 +1320,33 @@ local function encodeOPT_Z(flags)
     return table.concat(bits)
 end
 
+function addNSID (pkt,Z)
+	local udp_payload_size = 4096
+	local _,opt = bin.unpack(">S","3")
+	addOPT(pkt,Z,udp_payload_size,opt)  
+end
 ---
 -- Adds an OPT RR to a DNS packet's additional section. Only the table of Z
 -- flags is supported (i.e., not RDATA). See RFC 2671 section 4.3.
 -- @param pkt Table representing DNS packet.
 -- @param Z Table of Z flags. Only DO is supported.
-function addOPT(pkt, Z)
+function addOPT(pkt, Z, udp_payload_size, opt)
+    local udp_payload_size = udp_payload_size or 4096
+    local rdata = opt or ""
     if type(pkt) ~= "table" then return nil end
     if type(pkt.additional) ~= "table" then return nil end
     local _, Z_int = bin.unpack(">S", bin.pack("B", encodeOPT_Z(Z)))
     local opt = {
         type = types.OPT,
-        class = 4096,  -- Actually the sender UDP payload size.
+        class = udp_payload_size,  -- Actually the sender UDP payload size.
+	--   EXTENDED-RCODE + VERSION + flags 
+        --   as this evaluats to 0 + 0 + Z_int
+	--   why dont i just do ttl = Z_int
+  	--   this is probably wrong 
+	--   have to find out where i ctrl+c; ctrl+v'ed these from 
         ttl = 0 * (0x01000000) + 0 * (0x00010000) + Z_int,
-        rdlen = 0,
-        rdata = "",
+        rdlen = string.len(rdata),
+        rdata = rdata,
     }
     table.insert(pkt.additional, opt)
     return pkt
