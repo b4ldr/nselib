@@ -1126,6 +1126,11 @@ decoder[types.TXT] =
 
   end
 
+decoder[types.OPT] =  
+    function(entry, data, pos)
+    end
+
+
 -- Decodes MX record, puts it in <code>entry.MX</code>.
 --
 -- <code>entry.MX</code> has the fields <code>pref</code> and
@@ -1142,23 +1147,24 @@ decoder[types.MX] =
         _, entry.MX.server = decStr(data, np)
     end
 
--- Decodes SRV record, puts it in <code>entry.SRV</code>.
+
+
+-- Decodes OPT record, puts it in <code>entry.OPT</code>.
 --
--- <code>entry.SRV</code> has the fields <code>prio</code>,
+-- <code>entry.OPT</code> has the fields <code>prio</code>,
 -- <code>weight</code>, <code>port</code> and
 -- <code>target</code>.
 -- @param entry RR in packet.
 -- @param data Complete encoded DNS packet.
 -- @param pos Position in packet after RR.
-decoder[types.SRV] =
+decoder[types.OPT] =
   function(entry, data, pos)
      local np = pos - #entry.data
      local _
-     entry.SRV = {}
-     np, entry.SRV.prio, entry.SRV.weight, entry.SRV.port = bin.unpack(">S>S>S", data, np)
-     np, entry.SRV.target = decStr(data, np)
+     entry.OPT = {}
+     np, entry.OPT.prio, entry.OPT.weight, entry.OPT.port = bin.unpack(">S>S>S", data, np)
+     np, entry.OPT.target = decStr(data, np)
   end
-
 ---
 -- Decodes returned resource records (answer, authority, or additional part).
 -- @param data Complete encoded DNS packet.
@@ -1322,7 +1328,7 @@ end
 
 function addNSID (pkt,Z)
 	local udp_payload_size = 4096
-	local _,opt = bin.unpack(">S","3")
+	local opt = bin.pack(">S",3) .. bin.pack(">S",0) 
 	addOPT(pkt,Z,udp_payload_size,opt)  
 end
 ---
