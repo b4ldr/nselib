@@ -1126,8 +1126,30 @@ decoder[types.TXT] =
 
   end
 
-decoder[types.OPT] =  
-    function(entry, data, pos)
+---
+-- Decodes OPT record, puts it in <code>entry.OPT</code>.
+--
+-- <code>entry.OPT</code> has the fields <code>mname</code>, <code>rname</code>,
+-- <code>serial</code>, <code>refresh</code>, <code>retry</code>,
+-- <code>expire</code>, and <code>minimum</code>.
+-- @param entry RR in packet.
+-- @param data Complete encoded DNS packet.
+-- @param pos Position in packet after RR.
+decoder[types.OPT] = 
+   function(entry, data, pos)
+
+       local np = pos - #entry.data
+
+       entry.OPT = {}
+
+       entry.OPT.bufsize = entry.class
+
+       np, entry.OPT.rcode,
+         entry.OPT.version,
+         entry.OPT.zflags,
+         entry.OPT.rdlen
+          = bin.unpack(">CCBC", entry.ttl, np)
+       entry.OPT.data = bin.unpack(">H", data, entry.OPT.rdlen)
     end
 
 
@@ -1151,21 +1173,6 @@ decoder[types.MX] =
 
 -- Decodes OPT record, puts it in <code>entry.OPT</code>.
 --
--- <code>entry.OPT</code> has the fields <code>prio</code>,
--- <code>weight</code>, <code>port</code> and
--- <code>target</code>.
--- @param entry RR in packet.
--- @param data Complete encoded DNS packet.
--- @param pos Position in packet after RR.
-decoder[types.OPT] =
-  function(entry, data, pos)
-     local np = pos - #entry.data
-     local _
-     entry.OPT = {}
-     np, entry.OPT.prio, entry.OPT.weight, entry.OPT.port = bin.unpack(">S>S>S", data, np)
-     np, entry.OPT.target = decStr(data, np)
-  end
----
 -- Decodes returned resource records (answer, authority, or additional part).
 -- @param data Complete encoded DNS packet.
 -- @param count Value of according counter in header.
@@ -1182,7 +1189,6 @@ local function decodeRR(data, count, pos)
         pos, reslen = bin.unpack(">S", data, pos)
 
         pos, currRR.data = bin.unpack("A" .. reslen, data, pos)
-
         -- try to be smart: decode per type
         if decoder[currRR.dtype] then
             decoder[currRR.dtype](currRR, data, pos)
