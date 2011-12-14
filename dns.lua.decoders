@@ -1,0 +1,702 @@
+Index: dns.lua
+===================================================================
+--- dns.lua	(revision 22223)
++++ dns.lua	(working copy)
+@@ -33,6 +33,7 @@
+ 
+ require("ipOps")
+ require("stdnse")
++require("base64")
+ 
+ get_servers = nmap.get_dns_servers
+ 
+@@ -43,7 +44,6 @@
+ -- @class table
+ types = {
+    A = 1,
+-   AAAA = 28,
+    NS = 2,
+    SOA = 6,
+    CNAME = 5,
+@@ -51,8 +51,15 @@
+    HINFO = 13,
+    MX = 15,
+    TXT = 16,
++   AAAA = 28,
+    SRV = 33,
++   OPT = 41,
++   DS = 43,
+    SSHFP = 44,
++   RRSIG = 46,
++   NSEC = 47,
++   DNSKEY = 48,
++   NSEC3 = 50,
+    AXFR = 252,
+    ANY = 255
+ }
+@@ -62,7 +69,6 @@
+ 	ANY = 255
+ }
+ 
+-
+ ---
+ -- Repeatedly sends UDP packets to host, waiting for an answer.
+ -- @param data Data to be sent.
+@@ -233,6 +239,113 @@
+ -- * <code>dtype</code>: Desired DNS record type (default: <code>"A"</code>).
+ -- * <code>host</code>: DNS server to be queried (default: DNS servers known to Nmap).
+ -- * <code>port</code>: Port of DNS server to connect to (default: <code>53</code>).
++-- * <code>tries</code>: How often should <code>dnssec_query</code> try to contact another server (for non-recursive queries).
++-- * <code>retAll</code>: Return all answers, not just the first.
++-- * <code>retPkt</code>: Return the packet instead of using the answer-fetching mechanism.
++-- * <code>norecurse</code> If true, do not set the recursion (RD) flag.
++-- * <code>retDnssec</code> if true then the value of pkt.DNSSEC is returned as a third return value
++-- @return True if a dns response was received and contained an answer of the requested type,
++--  or the decoded dns response was requested (retPkt) and is being returned - or False otherwise.
++-- @return String answer of the requested type, Table of answers or a String error message of one of the following:
++--  "No Such Name", "No Servers", "No Answers", "Unable to handle response"
++function dnssec_query(dname, options)
++--This should reall either be joined with or utilise the function below
++
++   if not options then options = {} end
++
++   local dtype, host, port, tries = options.dtype, options.host, options.port, options.tries
++
++   if not tries then tries = 10 end -- don't get into an infinite loop
++
++   if not options.sendCount then options.sendCount = 2 end
++
++   if type( options.timeout ) ~= "number" then options.timeout = get_default_timeout() end
++
++   if type(dtype) == "string" then
++      dtype = types[dtype]
++   end
++   if not dtype then dtype = types.A end
++
++   local srv
++   local srvI = 1
++   if not port then port = 53 end
++   if not host then
++      srv = get_servers()
++      if srv and srv[1] then
++         host = srv[1]
++      else
++         return false, "No Servers"
++      end
++   elseif type(host) == "table" then
++      srv = host
++      host = srv[1]
++   end
++   local pkt = newPacket()
++   addQuestion(pkt, dname, dtype)
++   if options.norecurse then pkt.flags.RD = false end
++
++   addEdns(pkt, dname, dtype, true)
++
++   local data = encode(pkt)
++
++   local status, response = sendPackets(data, host, port, options.timeout, options.sendCount)
++
++   -- if working with know nameservers, try the others
++   while((not status) and srv and srvI < #srv) do
++      srvI = srvI + 1
++      host = srv[srvI]
++      status, response = sendPackets(data, host, port, options.timeout, options.sendCount)
++   end
++
++
++   -- if we got any response:
++   if status then
++      response = response[1].data
++      local rPkt = decode(response)
++      -- is it a real answer?
++      if gotAnswer(rPkt)  then
++         if (options.retPkt) then
++            return rPkt.dnssec,true, rPkt
++         else
++            return rPkt.dnssec,findNiceAnswer(dtype, rPkt, options.retAll)
++         end
++      else -- if not, ask the next server in authority
++
++         local next_server = getAuthDns(rPkt)
++
++         -- if we got a CNAME, ask for the CNAME
++         if type(next_server) == 'table' and next_server.cname then
++            options.tries = tries - 1
++            return rPkt.dnssec,dnssec_query(next_server.cname, options)
++         end
++
++         -- only ask next server in authority, if 
++         -- we got an auth dns and
++         -- it isn't the one we just asked
++         if next_server and next_server ~= host and tries > 1 then
++            options.host = next_server
++            options.tries = tries - 1
++            return rPkt.dnssec,dnssec_query(dname, options)
++         end
++      end
++
++      -- nothing worked
++      stdnse.print_debug(1, "dns.dnssec_query() failed to resolve the requested dnssec_query%s%s", dname and ": " or ".", dname or "")
++      return rPkt.dnssec,false, "No Answers"
++   else
++      stdnse.print_debug(1, "dns.dnssec_query() got zero responses attempting to resolve dnssec_query%s%s", dname and ": " or ".", dname or "")
++      return false, false, "No Answers"
++   end
++end
++
++
++---
++-- Query DNS servers for a DNS record.
++-- @param dname Desired domain name entry.
++-- @param options A table containing any of the following fields:
++-- * <code>dtype</code>: Desired DNS record type (default: <code>"A"</code>).
++-- * <code>host</code>: DNS server to be queried (default: DNS servers known to Nmap).
++-- * <code>port</code>: Port of DNS server to connect to (default: <code>53</code>).
+ -- * <code>tries</code>: How often should <code>query</code> try to contact another server (for non-recursive queries).
+ -- * <code>retAll</code>: Return all answers, not just the first.
+ -- * <code>retPkt</code>: Return the packet instead of using the answer-fetching mechanism.
+@@ -484,6 +597,126 @@
+   return true, answers
+ end
+ 
++-- Answer fetcher for NSEC3 records.
++-- @param dec Decoded DNS response.
++-- @param retAll If true, return all entries, not just the first.
++-- @return True if one or more answers of the required type were found - otherwise false.
++-- @return String first dns NSEC3 record or Table of NSEC3 records or String Error message.
++--  Note that the format of a returned NSEC3 answer is "preference:hostname:IPaddress" where zero
++--  or more IP addresses may be present.
++answerFetcher[types.NSEC3] = function(dec, retAll)
++   local nsec3, answers = {}, {}
++   for _, auth in ipairs(dec.auth) do
++      if auth.NSEC3 then nsec3[#nsec3+1] = auth.NSEC3 end
++      if not retAll then break end
++   end
++   if #nsec3 == 0 then
++      stdnse.print_debug(1, "dns.answerFetcher found no recornsec3 of the required type: NSEC3")
++      return false, "No Answers"
++   end
++   for _, nsec3rec in ipairs(nsec3) do
++      table.insert( answers, ("%s:%s"):format(nsec3rec.name or "-", stdnse.strjoin(":", nsec3rec.types) or "-"))
++   end
++   if not retAll then return true, answers[1] end
++   return true, answers
++end
++
++-- Answer fetcher for NSEC records.
++-- @param dec Decoded DNS response.
++-- @param retAll If true, return all entries, not just the first.
++-- @return True if one or more answers of the required type were found - otherwise false.
++-- @return String first dns NSEC record or Table of NSEC records or String Error message.
++--  Note that the format of a returned NSEC answer is "preference:hostname:IPaddress" where zero
++--  or more IP addresses may be present.
++answerFetcher[types.NSEC] = function(dec, retAll)
++   local nsec, answers = {}, {}
++   for _, auth in ipairs(dec.auth) do
++      if auth.NSEC then nsec[#nsec+1] = auth.NSEC end
++      if not retAll then break end
++   end
++   if #nsec == 0 then
++      stdnse.print_debug(1, "dns.answerFetcher found no recornsec of the required type: NSEC")
++      return false, "No Answers"
++   end
++   for _, nsecrec in ipairs(nsec) do
++      table.insert( answers, ("%s:%s:%s"):format(nsecrec.name or "-", nsecrec.dname or "-", stdnse.strjoin(":", nsecrec.types) or "-"))
++   end
++   if not retAll then return true, answers[1] end
++   return true, answers
++end
++
++-- Answer fetcher for DNSKEY records.
++-- @param dec Decoded DNS response.
++-- @param retAll If true, return all entries, not just the first.
++-- @return True if one or more answers of the required type were found - otherwise false.
++-- @return String first dns DNSKEY record or Table of DNSKEY records or String Error message.
++--  Note that the format of a returned DNSKEY answer is "preference:hostname:IPaddress" where zero
++--  or more IP addresses may be present.
++answerFetcher[types.DNSKEY] = function(dec, retAll)
++   local dnskey, answers = {}, {}
++   for _, ans in ipairs(dec.answers) do
++      if ans.DNSKEY then dnskey[#dnskey+1] = ans.DNSKEY end
++      if not retAll then break end
++   end
++   if #dnskey == 0 then
++      stdnse.print_debug(1, "dns.answerFetcher found no recordnskey of the required type: DNSKEY")
++      return false, "No Answers"
++   end
++   for _, dnskeyrec in ipairs(dnskey) do
++      table.insert( answers, ("%s:%s:%s:%s"):format(dnskeyrec.flags or "-", dnskeyrec.protocol or "-", dnskeyrec.algorithm or "-", dnskeyrec.key or "-"))
++   end
++   if not retAll then return true, answers[1] end
++   return true, answers
++end
++
++-- Answer fetcher for RRSIG records.
++-- @param dec Decoded DNS response.
++-- @param retAll If true, return all entries, not just the first.
++-- @return True if one or more answers of the required type were found - otherwise false.
++-- @return String first dns RRSIG record or Table of RRSIG records or String Error message.
++--  Note that the format of a returned RRSIG answer is "preference:hostname:IPaddress" where zero
++--  or more IP addresses may be present.
++answerFetcher[types.RRSIG] = function(dec, retAll)
++   local rrsig, answers = {}, {}
++   for _, ans in ipairs(dec.answers) do
++      if ans.RRSIG then rrsig[#rrsig+1] = ans.RRSIG end
++      if not retAll then break end
++   end
++   if #rrsig == 0 then
++      stdnse.print_debug(1, "dns.answerFetcher found no recorrrsig of the required type: RRSIG")
++      return false, "No Answers"
++   end
++   for _, rrsigrec in ipairs(rrsig) do
++      table.insert( answers, ("%s:%s:%s:%s:%s:%s:%s:%s:%s"):format(rrsigrec.typecovered or "-", rrsigrec.algorithm or "-", rrsigrec.labels or "-",  rrsigrec.ttl or "-",  rrsigrec.expiry or "-", rrsigrec.inception or "-", rrsigrec.keytag or "-", rrsigrec.name or "-", rrsigrec.key or "-"))
++   end
++   if not retAll then return true, answers[1] end
++   return true, answers
++end
++
++-- Answer fetcher for DS records.
++-- @param dec Decoded DNS response.
++-- @param retAll If true, return all entries, not just the first.
++-- @return True if one or more answers of the required type were found - otherwise false.
++-- @return String first dns DS record or Table of DS records or String Error message.
++--  Note that the format of a returned DS answer is "preference:hostname:IPaddress" where zero
++--  or more IP addresses may be present.
++answerFetcher[types.DS] = function(dec, retAll)
++   local ds, answers = {}, {}
++   for _, ans in ipairs(dec.answers) do
++      if ans.DS then ds[#ds+1] = ans.DS end
++      if not retAll then break end
++   end
++   if #ds == 0 then
++      stdnse.print_debug(1, "dns.answerFetcher found no records of the required type: DS")
++      return false, "No Answers"
++   end
++   for _, dsrec in ipairs(ds) do
++      table.insert( answers, ("%s:%s:%s:%s"):format(dsrec.keytag or "-", dsrec.algorithm or "-", dsrec.digesttype or "-", dsrec.data or "-"))
++   end
++   if not retAll then return true, answers[1] end
++   return true, answers
++end
++
+ -- Answer fetcher for NS records.
+ -- @name answerFetcher[types.NS]
+ -- @class function
+@@ -536,13 +769,57 @@
+    if (#dec.answers > 0) then
+       if answerFetcher[dtype] then 
+          return answerFetcher[dtype](dec, retAll)
++      elseif dtype == 255 then
++         local tmp_types, tmp_answers = {}, {} 
++         for _, answer in ipairs(dec.answers) do
++            if answerFetcher[answer.dtype] and answer.dtype ~= 46 and answer.dtype ~= 47 and answer.dtype ~= 48 and answer.dtype ~= 50 then 
++               if #tmp_types > 1 then
++                  local type_test = false
++                  for _,v in ipairs(tmp_types) do
++                      if v == answer.dtype then 
++                         type_test = true 
++                      end
++                   end
++                   if type_test == false then 
++                      table.insert(tmp_types,answer.dtype) 
++                   end
++                else 
++                   table.insert(tmp_types,answer.dtype) 
++                end
++             end
++          end
++          for _, tmp_type in ipairs(tmp_types) do
++             local tmp_status, tmp_ans = answerFetcher[tmp_type](dec, retAll) 
++             if tmp_status then 
++                if type(tmp_ans) == "table" then
++                   for _,tmp_an in ipairs(tmp_ans) do
++                      table.insert(tmp_answers, {tmp_type, tmp_an}) 
++                   end
++                else
++                   table.insert(tmp_answers,{tmp_type , tmp_ans})
++                end
++              end
++          end
++          return true, tmp_answers
+       else 
+          stdnse.print_debug(1, "dns.findNiceAnswer() does not have an answerFetcher for dtype %s",
+-            (type(dtype) == 'string' and dtype) or type(dtype) or "nil")
++            (type(dtype) == 'string' and dtype) or dtype or type(dtype) or "nil")
+          return false, "Unable to handle response"
+       end
+    elseif (dec.flags.RC3 and dec.flags.RC4) then
+-      return false, "No Such Name"
++      if #dec.auth > 0 then
++         for _, authrr in ipairs(dec.auth) do
++            if authrr.NSEC then
++               local _, answer = answerFetcher[types.NSEC](dec, retAll)
++               return false, answer
++	    elseif authrr.NSEC3 then
++               return false, "NSEC3"
++            end
++         end
++            return false, "No Such Name"
++      else
++         return false, "No Such Name"
++      end
+    else
+       stdnse.print_debug(1, "dns.findNiceAnswer() found zero answers in a response, but got an unexpected flags.replycode")
+       return false, "No Answers"
+@@ -681,6 +958,47 @@
+    end
+ end
+ 
++---
++-- Encodes DNS flags to a binary digit string.
++-- @param flags Flag table, each entry representing a flag (only DO flag implmented).
++-- @return Binary digit string representing flags.
++local function encodeZflags(flags)
++   if type(flags) == "string" then return flags end
++   if type(flags) ~= "table" then return nil end
++   local fb = ""
++   if flags.DO then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z2 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z3 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z4 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z5 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z6 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z7 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z8 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z9 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z10 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z11 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z12 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z13 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z14 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z15 then fb = fb .. "1" else fb = fb .. "0" end
++   if flags.Z16 then fb = fb .. "1" else fb = fb .. "0" end
++   return fb
++end
++
++---
++-- Encodes the question part of a DNS request.
++-- @param edns Table of edns.
++-- @return Encoded question string.
++local function encodeEdns(edns)
++   if type(edns) ~= "table" then return nil end
++   local encA = ""
++   for _, v in ipairs(edns) do
++      local zflags = encodeZflags(v.zflags)
++      encA = encA .. bin.pack(">xSSCCBS",  v.type, v.bufsize, v.rcode, v.version, zflags, 0) .. ""
++   end
++   return encA
++end
++
+ --
+ -- Encodes a FQDN
+ -- @param fqdn containing the fully qualified domain name
+@@ -778,8 +1096,11 @@
+       aorulen = #pkt.updates
+       data = data .. encodeUpdates( pkt.updates )
+    end
++   -- This bit has changed from the version i have used will double check 
++   -- but i suspect updates addes to the adition section like edns
++   if #pkt.edns > 0 then data = data .. encodeEdns(pkt.edns) end
+ 
+-   local encStr = bin.pack(">SBS4", pkt.id, encFlags, qorzlen, aorplen, aorulen, #pkt.additional) .. data
++   local encStr = bin.pack(">SBS4", pkt.id, encFlags, qorzlen, aorplen, aorulen, #pkt.additional+#pkt.edns) .. data
+    return encStr
+ end
+ 
+@@ -911,11 +1232,198 @@
+       = bin.unpack(">I5", data, np)
+ end
+ 
++---
++-- Decodes OPT record, puts it in <code>entry.OPT</code>.
++--
++-- <code>entry.OPT</code> has the fields <code>mname</code>, <code>rname</code>,
++-- <code>serial</code>, <code>refresh</code>, <code>retry</code>,
++-- <code>expire</code>, and <code>minimum</code>.
++-- @param entry RR in packet.
++-- @param data Complete encoded DNS packet.
++-- @param pos Position in packet after RR.
++decoder[types.OPT] = function(entry, data, pos)
++
++   local np = pos - #entry.data
++
++   entry.OPT = {}
++
++   entry.OPT.bufsize = entry.class
++
++   entry.OPT.rcode,
++     entry.OPT.version,
++     entry.OPT.zflags
++      = bin.unpack(">CCB", entry.ttl, np)
++end
++
++---
++-- Decodes RRSIG records.
++-- Puts result in <code>entry.domain</code>.
++-- @name decoder[types.RRSIG]
++-- @class function
++-- @param entry RR in packet.
++-- @param data Complete encoded DNS packet.
++-- @param pos Position in packet after RR.
++decoder[types.RRSIG] = function(entry, data, pos)
++
++   local np = pos - #entry.data
++
++   entry.RRSIG = {};
++   np, entry.RRSIG.typecovered,
++      entry.RRSIG.algorithm,
++      entry.RRSIG.labels,
++      entry.RRSIG.ttl,
++      entry.RRSIG.expiry,
++      entry.RRSIG.inception,
++      entry.RRSIG.keytag
++        = bin.unpack(">SCCI3S", data, np)
++   np, entry.RRSIG.name = decStr(data, np)
++   --- i think the -2 here is the 2 bytes from the label but need to check
++   local dsize = #entry.data - #entry.RRSIG.name - 18 - 2
++   np, entry.RRSIG.data = bin.unpack("A".. dsize, data, np)
++   entry.RRSIG.key = base64.enc(entry.RRSIG.data)
++end
++
++---
++-- Decodes DS records.
++-- Puts result in <code>entry.domain</code>.
++-- @name decoder[types.DS]
++-- @class function
++-- @param entry RR in packet.
++-- @param data Complete encoded DNS packet.
++-- @param pos Position in packet after RR.
++decoder[types.DS] = function(entry, data, pos)
++
++   local np = pos - #entry.data
++
++   entry.DS = {};
++   np, entry.DS.keytag,
++      entry.DS.algorithm,
++      entry.DS.digesttype
++        = bin.unpack(">SCC", data, np)
++   local dsize = #entry.data - 4
++   np, entry.DS.data = bin.unpack("H".. dsize, data, np)
++end
++
++---
++-- Decodes DNSKEY records.
++-- Puts result in <code>entry.domain</code>.
++-- @name decoder[types.DNSKEY]
++-- @class function
++-- @param entry RR in packet.
++-- @param data Complete encoded DNS packet.
++-- @param pos Position in packet after RR.
++decoder[types.DNSKEY] = function(entry, data, pos)
++
++   local np = pos - #entry.data
++
++   entry.DNSKEY = {};
++   np, entry.DNSKEY.flags,
++      entry.DNSKEY.protocol,
++      entry.DNSKEY.algorithm
++        = bin.unpack(">SCC", data, np)
++   local ksize = #entry.data - 4
++   np, entry.DNSKEY.data = bin.unpack("A".. ksize, data, np)
++   entry.DNSKEY.key = base64.enc(entry.DNSKEY.data)
++end
++
++---
++-- Splits a string up into a table of single characters.
++-- @param str String to be split up.
++-- @return Table of characters.
++local function str2tbl(str)
++   local tbl = {}
++   for i = 1, #str do
++      table.insert(tbl, string.sub(str, i, i))
++   end
++   return tbl
++end
++
++---
++-- Decodes NSEC3 flags.
++-- @param flgStr Flags as a binary digit string.
++-- @return Table representing flags.
++local function decodeFlagsNSEC3(flgStr)
++   local flags = {}
++   local flgTbl = str2tbl(flgStr)
++   if flgTbl[1] == '1' then flags.NSEC3_1 = true end
++   if flgTbl[2] == '1' then flags.NSEC3_2 = true end   
++   if flgTbl[3] == '1' then flags.NSEC3_3 = true end
++   if flgTbl[4] == '1' then flags.NSEC3_4 = true end   
++   if flgTbl[5] == '1' then flags.NSEC3_5 = true end   
++   if flgTbl[6] == '1' then flags.NSEC3_6 = true end   
++   if flgTbl[7] == '1' then flags.NSEC3_7 = true end   
++   if flgTbl[8] == '1' then flags.OPTOUT = true end   
++   return flags
++end
++---
+ -- Decodes records that consist only of one domain, for example CNAME, NS, PTR.
+ -- Puts result in <code>entry.domain</code>.
+ -- @param entry RR in packet.
+ -- @param data Complete encoded DNS packet.
+ -- @param pos Position in packet after RR.
++decoder[types.NSEC3] = function (entry, data, pos)
++   local np = pos - #entry.data
++   local flags
++   entry.NSEC3 = {}
++   entry.NSEC3.salt, entry.NSEC3.hash = {}, {}
++   np, entry.NSEC3.hash.alg,
++     flags,
++     entry.NSEC3.iterations, 
++     entry.NSEC3.salt.size = bin.unpack(">CBSC", data, np)
++   
++   entry.NSEC3.flags = decodeFlagsNSEC3(flags)
++   
++   np, entry.NSEC3.salt.bin = bin.unpack(">H" .. entry.NSEC3.salt.size, data, np)
++
++   np, entry.NSEC3.hash.size = bin.unpack(">C", data, np) 
++   np, entry.NSEC3.hash.bin = bin.unpack(">H" .. entry.NSEC3.hash.size, data, np)
++
++   np, entry.NSEC3.WinBlockNo, entry.NSEC3.bmplength = bin.unpack(">CC", data, np)
++   np, entry.NSEC3.bin = bin.unpack(">B".. entry.NSEC3.bmplength, data, np)
++   entry.NSEC3.types = {}
++   for i=1, string.len(entry.NSEC3.bin) do
++      local bit = string.sub(entry.NSEC3.bin,i,i)
++      if bit == "1" then
++         --the first bit represents window block 0 hence -1
++         table.insert(entry.NSEC3.types, (entry.NSEC3.WinBlockNo*256+i-1))
++      end
++   end
++   --stdnse.print_debug("alg: %s, iterations: %s, salt_sz: %s, hash_sz: %s", entry.NSEC3.hash.alg, entry.NSEC3.iterations, entry.NSEC3.salt.size, entry.NSEC3.hash.size)
++   --stdnse.print_debug("salt: %s", entry.NSEC3.salt.bin)
++   --stdnse.print_debug("hash: %s", entry.NSEC3.hash.bin)
++   --stdnse.print_debug("types: %s", stdnse.strjoin(":",entry.NSEC3.types))
++
++end
++
++
++-- Decodes records that consist only of one domain, for example CNAME, NS, PTR.
++-- Puts result in <code>entry.domain</code>.
++-- @param entry RR in packet.
++-- @param data Complete encoded DNS packet.
++-- @param pos Position in packet after RR.
++decoder[types.NSEC] = function (entry, data, pos)
++   local np = pos - #entry.data
++   entry.NSEC = {}
++   entry.NSEC.dname = entry.dname
++   entry.NSEC.NSEC = true
++   np, entry.NSEC.name = decStr(data, np)
++   np, entry.NSEC.WinBlockNo, entry.NSEC.bmplength = bin.unpack(">CC", data, np)
++   np, entry.NSEC.bin = bin.unpack("B".. entry.NSEC.bmplength, data, np)
++   entry.NSEC.types = {}
++   for i=1, string.len(entry.NSEC.bin) do
++      local bit = string.sub(entry.NSEC.bin,i,i)
++      if bit == "1" then
++         --the first bit represents window block 0 hence -1
++         table.insert(entry.NSEC.types, (entry.NSEC.WinBlockNo*256+i-1))
++      end
++   end
++end
++
++-- Decodes records that consist only of one domain, for example CNAME, NS, PTR.
++-- Puts result in <code>entry.domain</code>.
++-- @param entry RR in packet.
++-- @param data Complete encoded DNS packet.
++-- @param pos Position in packet after RR.
+ local function decDomain(entry, data, pos)
+       local np = pos - #entry.data
+       local _
+@@ -994,8 +1502,23 @@
+       _, entry.MX.server = decStr(data, np)
+    end
+ 
++-- Decodes ANY record, puts it in <code>entry.ANY</code>.
++-- <code>entry.ANY</code> has the fields <code>prio</code>,
++-- <code>weight</code>, <code>port</code> and 
++-- <code>target</code>.
++-- @param entry RR in packet.
++-- @param data Complete encoded DNS packet.
++-- @param pos Position in packet after RR.
++decoder[types.ANY] =
++  function(entry, data, pos)
++    local np = pos - #entry.data
++    local _
++    entry.ANY = {}
++    np, entry.ANY.prio, entry.ANY.weight, entry.ANY.port = bin.unpack(">S>S>S", data, np)
++    np, entry.ANY.target = decStr(data, np)
++  end
++
+ -- Decodes SRV record, puts it in <code>entry.SRV</code>.
+---
+ -- <code>entry.SRV</code> has the fields <code>prio</code>,
+ -- <code>weight</code>, <code>port</code> and 
+ -- <code>target</code>.
+@@ -1038,18 +1561,6 @@
+ end
+ 
+ ---
+--- Splits a string up into a table of single characters.
+--- @param str String to be split up.
+--- @return Table of characters.
+-local function str2tbl(str)
+-   local tbl = {}
+-   for i = 1, #str do
+-      table.insert(tbl, string.sub(str, i, i))
+-   end
+-   return tbl
+-end
+-
+----
+ -- Decodes DNS flags.
+ -- @param flgStr Flags as a binary digit string.
+ -- @return Table representing flags.
+@@ -1099,6 +1610,14 @@
+       pos, pkt.auth = decodeRR(data, cnt.auth, pos)
+       pos, pkt.add = decodeRR(data, cnt.add, pos)
+    end
++
++   for _, auth in ipairs(pkt.auth) do
++      if auth.NSEC or auth.RRSIG or auth.DNSKEY or auth.DS or auth.NSEC3 then
++         pkt.dnssec = true
++         break
++      end
++   end
++
+    return pkt
+ end
+ 
+@@ -1117,6 +1636,10 @@
+    pkt.answers = {}
+    pkt.auth = {}
+    pkt.additional = {}
++   --This should be moved to the additional section
++   pkt.edns = {}
++   --used to track if we have dnssec
++   pkt.dnsec = false
+    return pkt
+ end
+ 
+@@ -1152,6 +1675,26 @@
+    table.insert(pkt.zones, { dname=dname, dtype=types.SOA, class=CLASS.IN })
+    return pkt
+ end
++---
++-- Adds a edns to a DNS packet table.
++-- @param pkt Table representing DNS packet.
++-- @param dname Domain name to be asked.
++-- @param dtype RR to be asked.
++function addEdns(pkt, dname, dtype, DO)
++   if type(pkt) ~= "table" then return nil end
++   if type(pkt.edns) ~= "table" then return nil end
++   local e = {}
++   pkt.dnsec = true
++   e.type = types['OPT']
++   e.bufsize = 4096
++   e.rcode = 0
++   e.version = 0
++   e.zflags = {}
++   if DO then e.zflags.DO = true end
++   e.data = 0
++   table.insert(pkt.edns, e)
++   return pkt
++end
+ 
+ --- 
+ -- Adds a update to a DNS packet table
