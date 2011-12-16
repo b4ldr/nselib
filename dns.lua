@@ -31,7 +31,6 @@
 
 module(... or "dns", package.seeall)
 
-require("base32")
 require("bit")
 require("ipOps")
 require("stdnse")
@@ -57,7 +56,6 @@ types = {
     OPT = 41,
     SSHFP = 44,
     NSEC = 47,
-    NSEC3 = 50,
     AXFR = 252,
     ANY = 255
 }
@@ -1016,49 +1014,6 @@ decoder[types.NSEC] = function (entry, data, pos)
     end
 end
 
--- Decodes NSEC3 records, puts result in <code>entry.NSEC</code>. See RFC 5155,
---
--- <code>entry.NSEC</code> has the fields <code>dname</code>,
--- <code>hash.alg</code>, and <code>hash.base32</code>.
--- <code>hash.bin</code>, and <code>hash.hex</code>.
--- <code>salt.bin</code>, and <code>salt.hex</code>.
--- <code>iterations</code>, and <code>types</code>.
--- @param entry RR in packet.
--- @param data Complete encoded DNS packet.
--- @param pos Position in packet after RR.
-decoder[types.NSEC3] = function (entry, data, pos)
-   local np = pos - #entry.data
-   local _
-   local flags
-   entry.NSEC3 = {}
-   entry.NSEC3.dname = entry.dname
-   entry.NSEC3.salt, entry.NSEC3.hash = {}, {}
-
-   np, entry.NSEC3.hash.alg,
-     flags,
-     entry.NSEC3.iterations = bin.unpack(">CBS", data, np) 
---   do we even need to decode these do we care about opt out?
---   entry.NSEC3.flags = decodeFlagsNSEC3(flags)
-  
-   np, entry.NSEC3.salt.bin = bin.unpack(">p",  data, np)
-   _, entry.NSEC3.salt.hex = bin.unpack("H" .. #entry.NSEC3.salt.bin, entry.NSEC3.salt.bin)
-
-   np, entry.NSEC3.hash.bin = bin.unpack(">p" , data, np)
-   _, entry.NSEC3.hash.hex = bin.unpack(">H" .. #entry.NSEC3.hash.bin , entry.NSEC3.hash.bin)
-   entry.NSEC3.hash.base32 = base32.enc(entry.NSEC3.hash.bin, true)
-
-   np, entry.NSEC3.WinBlockNo, entry.NSEC3.bmplength = bin.unpack(">CC", data, np)
-   np, entry.NSEC3.bin = bin.unpack(">B".. entry.NSEC3.bmplength, data, np)
-   entry.NSEC3.types = {}
-   for i=1, string.len(entry.NSEC3.bin) do
-      local bit = string.sub(entry.NSEC3.bin,i,i)
-      if bit == "1" then
-         table.insert(entry.NSEC3.types, (entry.NSEC3.WinBlockNo*256+i-1))
-      end
-   end
-
-end
-
 -- Decodes records that consist only of one domain, for example CNAME, NS, PTR.
 -- Puts result in <code>entry.domain</code>.
 -- @param entry RR in packet.
@@ -1170,9 +1125,23 @@ decoder[types.MX] =
     end
 
 
-
--- Decodes OPT record, puts it in <code>entry.OPT</code>.
+-- Decodes SRV record, puts it in <code>entry.SRV</code>.
 --
+-- <code>entry.SRV</code> has the fields <code>prio</code>,
+-- <code>weight</code>, <code>port</code> and
+-- <code>target</code>.
+-- @param entry RR in packet.
+-- @param data Complete encoded DNS packet.
+-- @param pos Position in packet after RR.
+decoder[types.SRV] =
+  function(entry, data, pos) 
+     local np = pos - #entry.data
+     local _
+     entry.SRV = {} 
+     np, entry.SRV.prio, entry.SRV.weight, entry.SRV.port = bin.unpack(">S>S>S", data, np)
+     np, entry.SRV.target = decStr(data, np)
+  end
+
 -- Decodes returned resource records (answer, authority, or additional part).
 -- @param data Complete encoded DNS packet.
 -- @param count Value of according counter in header.
