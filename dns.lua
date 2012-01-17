@@ -252,6 +252,7 @@ function query(dname, options)
     if not options then options = {} end
 
     local dtype, host, port = options.dtype, options.host, options.port
+
     local class = options.class or CLASS.IN
     if not options.tries then options.tries = 10 end -- don't get into an infinite loop
 
@@ -283,13 +284,15 @@ function query(dname, options)
     addQuestion(pkt, dname, dtype, class)
     if options.norecurse then pkt.flags.RD = false end
 
-    if options.dnssec and not options.nsid then
-        addOPT(pkt, {DO = true})
-    elseif options.dnssec and options.nsid then
-        addNSID(pkt, {DO = true})
-    elseif not options.dnssec and options.nsid then
-        addNSID(pkt, {})
-    end
+	if ( options.dnssec ) then
+		if ( options.nsid ) then
+			addNSID(pkt, {DO = true})
+		else
+			addOPT(pkt, {DO = true})
+		end
+	elseif ( options.nsid ) then
+		addNSID(pkt, {})
+	end
 
 	if ( options.flags ) then pkt.flags.raw = options.flags end
 	if ( options.id ) then pkt.id = options.id end
@@ -1091,21 +1094,13 @@ decoder[types.TXT] =
 -- @param data Complete encoded DNS packet.
 -- @param pos Position in packet after RR.
 decoder[types.OPT] = 
-   function(entry, data, pos)
-
-       local np = pos - #entry.data
-
-       entry.OPT = {}
-
-       entry.OPT.bufsize = entry.class
-
-       np, entry.OPT.rcode,
-         entry.OPT.version,
-         entry.OPT.zflags,
-         entry.OPT.rdlen
-          = bin.unpack(">CCBC", entry.ttl, np)
-       entry.OPT.data = bin.unpack(">H", data, entry.OPT.rdlen)
-    end
+	function(entry, data, pos)
+		local np = pos - #entry.data - 6
+		local opt = { bufsize = entry.class }
+		np, opt.rcode, opt.version, opt.zflags, opt.rdlen = bin.unpack(">CCSS", data, np)
+		np, opt.data = bin.unpack("A" .. opt.rdlen, data, np)
+  		entry.OPT = opt
+	end
 
 
 -- Decodes MX record, puts it in <code>entry.MX</code>.
@@ -1124,7 +1119,6 @@ decoder[types.MX] =
         _, entry.MX.server = decStr(data, np)
     end
 
-
 -- Decodes SRV record, puts it in <code>entry.SRV</code>.
 --
 -- <code>entry.SRV</code> has the fields <code>prio</code>,
@@ -1134,10 +1128,10 @@ decoder[types.MX] =
 -- @param data Complete encoded DNS packet.
 -- @param pos Position in packet after RR.
 decoder[types.SRV] =
-  function(entry, data, pos) 
+  function(entry, data, pos)
      local np = pos - #entry.data
      local _
-     entry.SRV = {} 
+     entry.SRV = {}
      np, entry.SRV.prio, entry.SRV.weight, entry.SRV.port = bin.unpack(">S>S>S", data, np)
      np, entry.SRV.target = decStr(data, np)
   end
@@ -1158,6 +1152,7 @@ local function decodeRR(data, count, pos)
         pos, reslen = bin.unpack(">S", data, pos)
 
         pos, currRR.data = bin.unpack("A" .. reslen, data, pos)
+
         -- try to be smart: decode per type
         if decoder[currRR.dtype] then
             decoder[currRR.dtype](currRR, data, pos)
@@ -1303,30 +1298,24 @@ end
 
 function addNSID (pkt,Z)
 	local udp_payload_size = 4096
-	local opt = bin.pack(">S",3) .. bin.pack(">S",0) 
-	addOPT(pkt,Z,udp_payload_size,opt)  
+	local opt = bin.pack(">SS",3, 0) -- nsid data
+	addOPT(pkt,Z,opt)  
 end
 ---
 -- Adds an OPT RR to a DNS packet's additional section. Only the table of Z
 -- flags is supported (i.e., not RDATA). See RFC 2671 section 4.3.
 -- @param pkt Table representing DNS packet.
 -- @param Z Table of Z flags. Only DO is supported.
-function addOPT(pkt, Z, udp_payload_size, opt)
-    local udp_payload_size = udp_payload_size or 4096
+function addOPT(pkt, Z, opt)
     local rdata = opt or ""
     if type(pkt) ~= "table" then return nil end
     if type(pkt.additional) ~= "table" then return nil end
     local _, Z_int = bin.unpack(">S", bin.pack("B", encodeOPT_Z(Z)))
     local opt = {
         type = types.OPT,
-        class = udp_payload_size,  -- Actually the sender UDP payload size.
-	--   EXTENDED-RCODE + VERSION + flags 
-        --   as this evaluats to 0 + 0 + Z_int
-	--   why dont i just do ttl = Z_int
-  	--   this is probably wrong 
-	--   have to find out where i ctrl+c; ctrl+v'ed these from 
+        class = 4096,  -- Actually the sender UDP payload size.
         ttl = 0 * (0x01000000) + 0 * (0x00010000) + Z_int,
-        rdlen = string.len(rdata),
+        rdlen = #rdata,
         rdata = rdata,
     }
     table.insert(pkt.additional, opt)
