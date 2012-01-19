@@ -287,11 +287,15 @@ function query(dname, options)
 	if ( options.dnssec ) then
 		if ( options.nsid ) then
 			addNSID(pkt, {DO = true})
+		elseif ( options.client_subnet) then
+			add_client_subnet(pkt, {DO = true}, options.client_subnet)
 		else
 			addOPT(pkt, {DO = true})
 		end
 	elseif ( options.nsid ) then
 		addNSID(pkt, {})
+	elseif ( options.client_subnet) then
+		add_client_subnet(pkt, {}, options.client_subnet)
 	end
 
 	if ( options.flags ) then pkt.flags.raw = options.flags end
@@ -1296,11 +1300,36 @@ local function encodeOPT_Z(flags)
     return table.concat(bits)
 end
 
+---
+-- Adds an client-subnet paylod to the OPT packet
+-- implementing http://tools.ietf.org/html/draft-vandergaast-edns-client-subnet-00
+-- @param pkt Table representing DNS packet.
+-- @param Z Table of Z flags. Only DO is supported.
+function add_client_subnet (pkt,Z,client_subnet)
+	local udp_payload_size = 4096
+	local code = 20730 -- temporay option-code http://comments.gmane.org/gmane.ietf.dnsext/19776
+	if not client_subnet.family then
+		client_subnet.family = 1 -- ipv4
+	end
+	local scope_mask = 0 -- In requests, it MUST be set to 0 see draft
+	local addr = stdnse.strsplit("%.",client_subnet.address)
+	local data = bin.pack(">SCCCCCC",client_subnet.family,client_subnet.mask,scope_mask,tonumber(addr[1]),tonumber(addr[2]),tonumber(addr[3]),tonumber(addr[4]))
+
+	local len = #data
+	local opt = bin.pack(">SS",code, #data) .. data
+	addOPT(pkt,Z,opt)  
+end
+
+---
+-- Adds an NSID paylod to the OPT packet
+-- @param pkt Table representing DNS packet.
+-- @param Z Table of Z flags. Only DO is supported.
 function addNSID (pkt,Z)
 	local udp_payload_size = 4096
 	local opt = bin.pack(">SS",3, 0) -- nsid data
 	addOPT(pkt,Z,opt)  
 end
+
 ---
 -- Adds an OPT RR to a DNS packet's additional section. Only the table of Z
 -- flags is supported (i.e., not RDATA). See RFC 2671 section 4.3.
