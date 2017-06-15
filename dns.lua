@@ -1312,8 +1312,9 @@ function add_client_subnet (pkt,Z,client_subnet)
 		client_subnet.family = 1 -- ipv4
 	end
 	local scope_mask = 0 -- In requests, it MUST be set to 0 see draft
-	local addr = stdnse.strsplit("%.",client_subnet.address)
-	local data = bin.pack(">SCCCCCC",client_subnet.family,client_subnet.mask,scope_mask,tonumber(addr[1]),tonumber(addr[2]),tonumber(addr[3]),tonumber(addr[4]))
+	-- local addr = stdnse.strsplit("%.",client_subnet.address)
+	-- local data = bin.pack(">SCCCCCC",client_subnet.family,client_subnet.mask,scope_mask,tonumber(addr[1]),tonumber(addr[2]),tonumber(addr[3]),tonumber(addr[4]))
+	local data = bin.pack(">SCCI",client_subnet.family,client_subnet.mask,scope_mask,client_subnet.address)
 
 	local len = #data
 	local opt = bin.pack(">SS",code, #data) .. data
